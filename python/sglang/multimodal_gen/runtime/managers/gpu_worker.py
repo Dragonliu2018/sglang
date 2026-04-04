@@ -266,13 +266,22 @@ class GPUWorker:
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
-                if self.rank == 0 and output_batch.output is not None:
+                if self.rank == 0 and (
+                    output_batch.output is not None
+                    or output_batch.audio is not None  # audio-only models
+                ):
+                    # For audio-only models the waveform is in output_batch.audio;
+                    # pass it as the outputs list so post_process_sample can write it.
+                    if output_batch.output is None and output_batch.audio is not None:
+                        outputs_to_save = [output_batch.audio]
+                    else:
+                        outputs_to_save = output_batch.output
                     output_paths = save_outputs(
-                        output_batch.output,
+                        outputs_to_save,
                         req.data_type,
                         req.fps,
                         True,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        lambda idx: req.output_file_path(len(outputs_to_save), idx),
                         audio=output_batch.audio,
                         audio_sample_rate=output_batch.audio_sample_rate,
                         output_compression=req.output_compression,

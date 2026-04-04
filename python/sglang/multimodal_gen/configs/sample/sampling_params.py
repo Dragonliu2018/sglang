@@ -76,12 +76,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    AUDIO = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.AUDIO:
+            return "wav"
         return "glb"
 
 
@@ -99,6 +102,11 @@ class SamplingParams:
 
     # Image inputs
     image_path: str | list[str] | None = None
+
+    # Audio inputs (voice cloning / TTS models, e.g. LongCat-AudioDiT)
+    prompt_audio_path: str | None = None
+    prompt_text: str | None = None
+    guidance_method: str = "cfg"
 
     # Text inputs
     prompt: str | list[str] | None = None
@@ -204,7 +212,7 @@ class SamplingParams:
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
+            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".wav"]
         ):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -826,6 +834,21 @@ class SamplingParams:
                 "values, e.g.: "
                 '--image-path "img1.png" "img2.png"'
             ),
+        )
+        add_argument(
+            "--prompt-audio-path",
+            type=str,
+            help="Path to a reference audio file for voice cloning (e.g. LongCat-AudioDiT)",
+        )
+        add_argument(
+            "--prompt-text",
+            type=str,
+            help="Transcript of the reference audio for voice cloning (e.g. LongCat-AudioDiT)",
+        )
+        add_argument(
+            "--guidance-method",
+            type=str,
+            help="Guidance method for flow matching models: 'cfg' or 'apg' (e.g. LongCat-AudioDiT)",
         )
         add_argument(
             "--moba-config-path",
