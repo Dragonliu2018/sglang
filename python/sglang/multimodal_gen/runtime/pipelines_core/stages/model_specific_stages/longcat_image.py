@@ -3,9 +3,7 @@
 import re
 from typing import List
 
-import numpy as np
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -15,6 +13,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# Exposed at module level so LongCatImagePipelineConfig can import without circular deps
+TOKENIZER_MAX_LENGTH = 512
 
 
 # --- Utility functions (adapted from diffusers LongCatImagePipeline) ---
@@ -85,30 +86,6 @@ def _prepare_pos_ids(
     return pos_ids
 
 
-def _calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-
-def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(
-        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-    )
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(
-        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-    )
-    return latents
-
-
 def _retrieve_latents(encoder_output, generator=None, sample_mode="sample"):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -124,36 +101,27 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
     """Pre-processing stage for LongCat-Image (T2I).
 
     Handles:
+    - Optional prompt rewriting via Qwen2.5-VL autoregressive decoding
     - Text encoding with Qwen2.5-VL text encoder
-    - Packed latent preparation
-    - Timestep/sigma schedule computation
-    - Position IDs (img_ids, txt_ids) for the transformer
-    """
+    - Position IDs (txt_ids, img_ids) and RoPE pre-computation
+    - CPU offload of text_encoder after encoding
 
-    TOKENIZER_MAX_LENGTH = 512
+    Latent preparation and timestep scheduling are handled by the standard
+    LatentPreparationStage and TimestepPreparationStage that follow this stage.
+    """
 
     def __init__(
         self,
-        vae,
         text_encoder,
         tokenizer,
         text_processor,
         transformer,
-        scheduler,
     ):
         super().__init__()
-        self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.text_processor = text_processor
         self.transformer = transformer
-        self.scheduler = scheduler
-
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1)
-            if getattr(self, "vae", None) and hasattr(self.vae, "config")
-            else 8
-        )
 
         self.prompt_template_encode_prefix = (
             "<|im_start|>system\nAs an image captioning expert, generate a descriptive text prompt "
@@ -205,7 +173,7 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
         generated_ids = self._greedy_generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            max_new_tokens=self.TOKENIZER_MAX_LENGTH,
+            max_new_tokens=TOKENIZER_MAX_LENGTH,
             device=device,
         )
 
@@ -315,18 +283,18 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
                     ]
                     all_tokens.extend(tokens)
 
-            if len(all_tokens) > self.TOKENIZER_MAX_LENGTH:
+            if len(all_tokens) > TOKENIZER_MAX_LENGTH:
                 logger.warning(
                     "Prompt truncated: max_sequence_length=%d, input_token_nums=%d",
-                    self.TOKENIZER_MAX_LENGTH,
+                    TOKENIZER_MAX_LENGTH,
                     len(all_tokens),
                 )
-                all_tokens = all_tokens[: self.TOKENIZER_MAX_LENGTH]
+                all_tokens = all_tokens[:TOKENIZER_MAX_LENGTH]
             batch_all_tokens.append(all_tokens)
 
         text_tokens_and_mask = self.tokenizer.pad(
             {"input_ids": batch_all_tokens},
-            max_length=self.TOKENIZER_MAX_LENGTH,
+            max_length=TOKENIZER_MAX_LENGTH,
             padding="max_length",
             return_attention_mask=True,
             return_tensors="pt",
@@ -384,51 +352,10 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
         prompt_embeds = prompt_embeds[:, prefix_len:-suffix_len, :]
         return prompt_embeds
 
-    def _prepare_latents(self, batch_size, height, width, dtype, device, generator):
-        """Create initial packed noisy latents and position IDs."""
-        num_channels_latents = 16
-        h = 2 * (int(height) // (self.vae_scale_factor * 2))
-        w = 2 * (int(width) // (self.vae_scale_factor * 2))
-
-        latent_image_ids = _prepare_pos_ids(
-            modality_id=1,
-            type="image",
-            start=(self.TOKENIZER_MAX_LENGTH, self.TOKENIZER_MAX_LENGTH),
-            height=h // 2,
-            width=w // 2,
-        ).to(device)
-
-        shape = (batch_size, num_channels_latents, h, w)
-        # Generate in float32 then cast to target dtype, matching diffusers behavior:
-        # diffusers does randn_tensor(..., device=device) then .to(dtype=dtype)
-        # Generating directly in bfloat16 gives slightly different std (~0.991 vs 1.000).
-        latents = randn_tensor(shape, generator=generator, device=device)
-        latents = latents.to(dtype=dtype)
-        latents = _pack_latents(latents, batch_size, num_channels_latents, h, w)
-        return latents, latent_image_ids
-
-    def _prepare_timesteps(self, num_inference_steps, image_seq_len, device):
-        """Compute timesteps and sigmas using FlowMatchEulerDiscreteScheduler."""
-        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
-        mu = _calculate_shift(
-            image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
-        )
-        self.scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
-        timesteps = self.scheduler.timesteps
-        return timesteps, sigmas
-
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
         dtype = torch.bfloat16
-        # Use CPU generator to match diffusers behavior: randn_tensor generates on CPU
-        # then moves to device, so CPU and CUDA generators produce different values
-        # for the same seed.
-        generator = torch.Generator(device="cpu").manual_seed(batch.seed)
 
         prompt = batch.prompt
         if isinstance(prompt, str):
@@ -439,20 +366,16 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
             negative_prompt = [negative_prompt]
 
         guidance_scale = getattr(batch, "guidance_scale", 4.5)
-        num_inference_steps = batch.num_inference_steps
-        height = batch.height
-        width = batch.width
-
         do_cfg = guidance_scale > 1.0
         enable_prompt_rewrite = getattr(batch, "enable_prompt_rewrite", True)
 
         # 1. Optionally rewrite prompt for richer detail (default: True, matches diffusers)
         if enable_prompt_rewrite:
-            logger.warning(
+            logger.info(
                 "Prompt rewriting is enabled (enable_prompt_rewrite=True). "
                 "This runs autoregressive decoding on the 28B text encoder (up to %d tokens). "
                 "Pass --enable-prompt-rewrite false to skip.",
-                self.TOKENIZER_MAX_LENGTH,
+                TOKENIZER_MAX_LENGTH,
             )
             prompt = self._rewire_prompt(prompt, device)
 
@@ -483,47 +406,48 @@ class LongCatImageBeforeDenoisingStage(PipelineStage):
             self.text_encoder.to("cpu")
             torch.cuda.empty_cache()
 
-        # 2. Prepare latents
-        latents, img_ids = self._prepare_latents(
-            1, height, width, dtype, device, generator
-        )
-
-        # 3. Prepare timesteps
-        image_seq_len = latents.shape[1]
-        timesteps, sigmas = self._prepare_timesteps(
-            num_inference_steps, image_seq_len, device
-        )
-
-        # 4. Populate batch
+        # 3. Populate batch for downstream stages
         batch.prompt_embeds = [prompt_embeds]
         batch.negative_prompt_embeds = (
             [negative_prompt_embeds]
             if negative_prompt_embeds is not None
             else [torch.zeros_like(prompt_embeds)]
         )
-        batch.latents = latents
-        batch.timesteps = timesteps
-        batch.num_inference_steps = len(timesteps)
-        batch.sigmas = sigmas.tolist()
-        batch.generator = generator
-        batch.raw_latent_shape = latents.shape
-        batch.height = height
-        batch.width = width
+        # Use CPU generator to match diffusers behavior: randn_tensor generates on CPU
+        # then moves to device, so CPU and CUDA generators produce different values
+        # for the same seed.
+        batch.generator = torch.Generator(device="cpu").manual_seed(batch.seed)
 
-        # Position IDs for the transformer
-        batch.img_ids = img_ids
+        # Position IDs for the transformer (img_ids set by LatentPreparationStage
+        # via maybe_prepare_latent_ids, stored as batch.latent_ids)
         batch.txt_ids = txt_ids
         batch.negative_txt_ids = negative_txt_ids
-
-        # Pre-compute RoPE embeddings once — txt_ids/img_ids are fixed across all 50 steps.
-        # This avoids calling _LongCatPosEmbed (3x get_1d_rotary_pos_embed in float64) every step.
-        ids = torch.cat((txt_ids, img_ids), dim=0).to(device)
-        batch.image_rotary_emb = self.transformer.pos_embed(ids)
 
         # CFG renorm params
         batch.enable_cfg_renorm = getattr(batch, "enable_cfg_renorm", True)
         batch.cfg_renorm_min = getattr(batch, "cfg_renorm_min", 0.0)
 
-        batch.scheduler = self.scheduler
+        return batch
 
+
+class LongCatImageRoPEStage(PipelineStage):
+    """Pre-compute RoPE embeddings after latents (and thus img_ids) are ready.
+
+    Must run after LatentPreparationStage so that batch.latent_ids is populated.
+    Pre-computing once avoids 3x float64 get_1d_rotary_pos_embed calls every step.
+    """
+
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        device = get_local_torch_device()
+        txt_ids = batch.txt_ids
+        img_ids = (
+            batch.latent_ids
+        )  # set by LatentPreparationStage via maybe_prepare_latent_ids
+        batch.img_ids = img_ids
+        ids = torch.cat((txt_ids, img_ids), dim=0).to(device)
+        batch.image_rotary_emb = self.transformer.pos_embed(ids)
         return batch

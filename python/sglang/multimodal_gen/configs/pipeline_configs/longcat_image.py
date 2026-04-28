@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
@@ -28,6 +29,29 @@ def _unpack_latents(latents, height, width, vae_scale_factor):
     return latents
 
 
+def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(
+        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+    )
+    return latents
+
+
+def _calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return image_seq_len * m + b
+
+
 @dataclass
 class LongCatImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the LongCat-Image T2I pipeline."""
@@ -42,6 +66,51 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
 
     dit_config: DiTConfig = field(default_factory=LongCatImageDitConfig)
     vae_config: VAEConfig = field(default_factory=LongCatImageVAEConfig)
+
+    # --- LatentPreparationStage hooks ---
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        vae_scale_factor = self.vae_config.get_vae_scale_factor()
+        # LongCat packs 2x2 patches: effective spatial resolution after packing
+        h = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        w = 2 * (int(batch.width) // (vae_scale_factor * 2))
+        num_channels_latents = self.dit_config.arch_config.num_channels_latents
+        # Unpacked shape — maybe_pack_latents will fold into tokens
+        return (batch_size, num_channels_latents, h, w)
+
+    def maybe_pack_latents(self, latents, batch_size, batch):
+        num_channels_latents = self.dit_config.arch_config.num_channels_latents
+        _, _, h, w = latents.shape
+        return _pack_latents(latents, batch_size, num_channels_latents, h, w)
+
+    def maybe_prepare_latent_ids(self, latents):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longcat_image import (
+            TOKENIZER_MAX_LENGTH,
+            _prepare_pos_ids,
+        )
+
+        # latents shape after packing: [B, (h//2)*(w//2), C*4]
+        # We need h//2 and w//2 — derive from the unpacked shape stored on the config.
+        # latents is still unpacked here (called before maybe_pack_latents in LatentPreparationStage)
+        _, _, h, w = latents.shape
+        return _prepare_pos_ids(
+            modality_id=1,
+            type="image",
+            start=(TOKENIZER_MAX_LENGTH, TOKENIZER_MAX_LENGTH),
+            height=h // 2,
+            width=w // 2,
+        )
+
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        # Generate in float32 then cast to bfloat16, matching diffusers behavior.
+        return torch.float32
+
+    # --- TimestepPreparationStage hook ---
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+        return sigmas
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]
